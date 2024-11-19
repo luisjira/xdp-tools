@@ -337,7 +337,7 @@ static __always_inline int xdp_fwd_flags(struct xdp_md *ctx, __u32 flags)
 }
 
 SEC("xdp")
-int xdp_fwd_fib_full(struct xdp_md *ctx)
+int xdp_fwd_fib_full_bql(struct xdp_md *ctx)
 {
 	return xdp_fwd_flags(ctx, 0);
 }

@@ -12,6 +12,14 @@
 
 #include "xdp-forward.h"
 
+#define DEBUG_PRINT 1 // Set to 1 for debugging, 0 to disable bpf_printk
+
+#if DEBUG_PRINT
+#define debug_printk(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__)
+#else
+#define debug_printk(fmt, ...)
+#endif
+
 #define AF_INET	2
 #define AF_INET6	10
 
@@ -20,7 +28,7 @@
 #define META_COOKIE_VAL 0x4242424242424242UL
 
 #define MAX_TX_PORTS 64
-#define TX_BATCH_SIZE 8
+#define TX_BATCH_SIZE 256
 
 #define IFINDEX_MASK 0xFFFFFFFF
 #define STATE_KEY(cpu, ifindex) (((__u64)cpu << 32) + ifindex)
@@ -36,7 +44,7 @@
 #define JIFFIES (bpf_ktime_get_ns() / (1000000000 / HZ))
 #define U32_MAX ((__u32) -1)
 
-#define POSDIFF(A, B) ((__s32)((A) - (B)) > 0 ? (A) - (B) : 0)
+#define POSDIFF(A, B) ((A) > (B) ? (A) - (B) : 0)
 #define AFTER_EQ(A, B) ((__s32)((A) - (B)) >= 0)
 #define MAX(A,B) (A > B ? A : B)
 
@@ -85,7 +93,6 @@ struct meta_val {
         __u64 cookie;
 };
 
-
 struct {
         __uint(type, BPF_MAP_TYPE_HASH);
         __type(key, __u64);
@@ -112,8 +119,9 @@ static int dql_completed(struct port_state *state, __u32 count)
 
 	/* Can't complete more than what's in queue */
 	if(count > num_queued - state->num_completed) {
-                bpf_printk("DQL: Completed more than queued");
-                return -1;
+                // debug_printk("dql_completed %d: Completing more than queued", state->tx_port_idx);
+                // TODO make negative since this is an error
+                return 0;
         }
 
 	completed = state->num_completed + count;
@@ -122,6 +130,8 @@ static int dql_completed(struct port_state *state, __u32 count)
 	inprogress = num_queued - completed;
 	prev_inprogress = state->prev_num_queued - state->num_completed;
 	all_prev_completed = AFTER_EQ(completed, state->prev_num_queued);
+
+        // debug_printk("dql_completed %d: ovlimit %u, inprogress %u, prev_ovlimit %u, all_prev_completed %u, prev_inprogress %u", state->tx_port_idx, ovlimit, inprogress, state->prev_ovlimit, all_prev_completed, prev_inprogress);
 
 	if ((ovlimit && !inprogress) ||
 	    (state->prev_ovlimit && all_prev_completed)) {
@@ -142,6 +152,7 @@ static int dql_completed(struct port_state *state, __u32 count)
 		 */
 		limit += POSDIFF(completed, state->prev_num_queued) +
 		     state->prev_ovlimit;
+                debug_printk("dql_completed %d: queue starved, new limit %u, POSDIFF %u, prev_ovlimit %u",state->tx_port_idx, limit, POSDIFF(completed, state->prev_num_queued), state->prev_ovlimit);
 		state->slack_start_time = JIFFIES;
 		state->lowest_slack = U32_MAX;
 	} else if (inprogress && prev_inprogress && !all_prev_completed) {
@@ -181,7 +192,9 @@ static int dql_completed(struct port_state *state, __u32 count)
 
                 /* Check if current time past slack_start + slack_hold*/
 		if ((JIFFIES >= (state->slack_start_time + state->slack_hold_time))) {
+                        debug_printk("dql_completed %d: queue not starved, limit %u, lowest_slack %u",state->tx_port_idx, limit, state->lowest_slack);
 			limit = POSDIFF(limit, state->lowest_slack);
+                        debug_printk("dql_completed %d: queue not starved, new limit %u", state->tx_port_idx, limit);
 			state->slack_start_time = JIFFIES;
 			state->lowest_slack = U32_MAX;
 		}
@@ -190,7 +203,9 @@ static int dql_completed(struct port_state *state, __u32 count)
 	/* Enforce bounds on limit */
         /* likely branch false */
 	limit = limit > state->max_limit ? state->max_limit :
-                        limit < state-> min_limit ? state->min_limit : limit;
+                       limit < state-> min_limit ? state->min_limit : limit;
+
+        // debug_printk("dql_completed %d: after bounds checking from %u set to %u", state->tx_port_idx, tmp, limit);
 
 	if (limit != state->limit) {
 		state->limit = limit;
@@ -202,6 +217,9 @@ static int dql_completed(struct port_state *state, __u32 count)
 	state->prev_last_obj_cnt = state->last_obj_cnt;
 	state->num_completed = completed;
 	state->prev_num_queued = num_queued;
+
+        debug_printk("dql_completed %d: limit %u, adj_imit %u, prev_num_queued %u, prev_ovlimit %u\n",
+                state->tx_port_idx, limit, state->adj_limit, num_queued, ovlimit);
         
         return 0;
 }
@@ -214,27 +232,28 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
         __u64 index;
         __u32 count = 0;
 
-        bpf_printk("BPF timer cb - key %lu\n", *key);
-
         state = bpf_map_lookup_elem(map, key);
         if (!state) {
-                bpf_printk("xdp_timer_cb: No state found for key %lu\n", *key);
-                goto out;
+                debug_printk("xdp_timer_cb: No state found for key %lu", *key);
+                // goto out;
+                return 0;
         }
+
+        // debug_printk("xdp_timer_cb %d: key %lu", state->tx_port_idx, *key);
 
         index = state->tx_port_idx;
         tgt_ifindex = (*key) & IFINDEX_MASK;
-        bpf_printk("xdp_timer_cb: tgt_ifindex %d tx_port_idx %lu\n", tgt_ifindex, index);
+        // debug_printk("xdp_timer_cb %d: tgt_ifindex %d tx_port_idx %lu", index, tgt_ifindex, index);
 
         for (i = 0; i < TX_BATCH_SIZE; i++) {
                 pkt = xdp_packet_dequeue(MAP_PTR(xdp_queues), index, NULL);
                 if (!pkt) {
-                        bpf_printk("xdp_timer_cb: No packet returned\n");
+                        debug_printk("xdp_timer_cb %d: No packet returned at iteration %d", state->tx_port_idx, i);
                         break;
                 }
                 count += pkt->len;
 
-                bpf_printk("xdp_timer_cb: Sending to ifindex %d\n", tgt_ifindex);
+                // debug_printk("xdp_timer_cb %d: Sending to ifindex %d", state->tx_port_idx, tgt_ifindex),;
                 xdp_packet_send(pkt, tgt_ifindex, 0);
         }
 
@@ -242,9 +261,8 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
 
         // TODO dql_completed
         return dql_completed(state, count);
-out:
-        
-        return 0;
+//out:      
+//        return 0;
 }
 
 static __u32 next_port_idx = 0;
@@ -261,6 +279,9 @@ static int init_tx_port(int ifindex, __u32 cpu)
         new_state.tx_port_idx = next_port_idx++;
         /* DQL: Initialize state */
         new_state.max_limit = DQL_MAX_LIMIT;
+        // TODO: Does this min_limit make sense?
+        new_state.min_limit = 0;
+        new_state.adj_limit = new_state.min_limit;
         new_state.slack_hold_time = HZ;
 	new_state.lowest_slack = U32_MAX;
 	new_state.slack_start_time = JIFFIES;
@@ -277,7 +298,7 @@ static int init_tx_port(int ifindex, __u32 cpu)
                       bpf_timer_set_callback(&state->timer, xdp_timer_cb)     ?:
                                                                                 0;
         if (!ret)
-                bpf_printk("TX port init OK ifindex %d cpu %u\n", ifindex, cpu);
+                debug_printk("TX port init OK ifindex %d cpu %u\n", ifindex, cpu);
 
         return ret;
 }
@@ -324,20 +345,23 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
         
         /* DQL: Check for available space */
         /* TODO check for packet length? */
-        if(state->adj_limit - state->num_queued < 0)
+        // debug_printk("========== New packet to XDP queue %d ==========", state->tx_port_idx);
+        // debug_printk("forward_to_dst %d: checking space with adj_limit %u num_queued %u len %u", state->tx_port_idx, state->adj_limit, state->num_queued, len);
+        if(state->adj_limit < state->num_queued){
+                debug_printk("forward_to_dst %d: not enough space", state->tx_port_idx);
                 return XDP_DROP;
+        }
 
         ret = bpf_redirect_map(&xdp_queues, state->tx_port_idx, 0);
-
-        bpf_printk("Redirect to XDP queue idx %d: %d\n", state->tx_port_idx, ret);
 
         if (ret == XDP_REDIRECT) {
                 /* Use data length as packet length */
                 state->last_obj_cnt = len;
                 state->num_queued += len;
                 if (port_can_xmit(state)) {
-                        int r = bpf_timer_start(&state->timer, 0 /* call asap */, 0);
-                        bpf_printk("Started BPF timer: %d\n", r);
+                        bpf_timer_start(&state->timer, 0 /* call asap */, 0);
+                        // int r = bpf_timer_start(&state->timer, 0 /* call asap */, 0);
+                        // debug_printk("forward_to_dst %d: Started BPF timer: %d", state->tx_port_idx, r);
                 }
         }
 

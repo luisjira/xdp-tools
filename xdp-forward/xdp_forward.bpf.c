@@ -66,20 +66,20 @@ struct port_state {
 
         /* DQL STATE */
         /* Fields accessed in enqueue path (dql_queued) */
-        __u32	num_queued;		/* Total ever queued */
-        __u32	adj_limit;		/* limit + num_completed */
-        __u32	last_obj_cnt;		/* Count at last queuing */
+        __u64	num_queued;		/* Total ever queued */
+        __u64	adj_limit;		/* limit + num_completed */
+        __u64	last_obj_cnt;		/* Count at last queuing */
 
         /* Fields accessed only by completion path (dql_completed) */
 
-        __u32	limit;                  /* Current limit, was aligned*/
-        __u32	num_completed;		/* Total ever completed */
+        __u64	limit;                  /* Current limit, was aligned*/
+        __u64	num_completed;		/* Total ever completed */
 
-        __u32	prev_ovlimit;		/* Previous over limit */
-        __u32	prev_num_queued;	/* Previous queue total */
-        __u32	prev_last_obj_cnt;	/* Previous queuing cnt */
+        __u64	prev_ovlimit;		/* Previous over limit */
+        __u64	prev_num_queued;	/* Previous queue total */
+        __u64	prev_last_obj_cnt;	/* Previous queuing cnt */
 
-        __u32	lowest_slack;		/* Lowest slack found */
+        __u64	lowest_slack;		/* Lowest slack found */
         __u64	slack_start_time;	/* Time slacks seen */
 
         /* Configuration */
@@ -108,6 +108,10 @@ struct {
         __uint(max_entries, 10240);
         __uint(map_extra, MAX_TX_PORTS);
 } xdp_queues SEC(".maps");
+
+// TODO remove
+bool time_set = false;
+__u64 timer_start;
 
 static int dql_completed(struct port_state *state, __u32 count)
 {
@@ -218,7 +222,7 @@ static int dql_completed(struct port_state *state, __u32 count)
 	state->num_completed = completed;
 	state->prev_num_queued = num_queued;
 
-        debug_printk("dql_completed %d: limit %u, adj_imit %u, prev_num_queued %u, prev_ovlimit %u\n",
+        debug_printk("dql_completed %d: limit %u, adj_limit %u, prev_num_queued %u, prev_ovlimit %u\n",
                 state->tx_port_idx, limit, state->adj_limit, num_queued, ovlimit);
         
         return 0;
@@ -247,6 +251,10 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
 
         for (i = 0; i < TX_BATCH_SIZE; i++) {
                 pkt = xdp_packet_dequeue(MAP_PTR(xdp_queues), index, NULL);
+                if (time_set) {
+                        debug_printk("xdp_timer_cb %d: callback time %d", state->tx_port_idx, bpf_ktime_get_ns() - timer_start);
+                        time_set = false;
+                }
                 if (!pkt) {
                         debug_printk("xdp_timer_cb %d: No packet returned at iteration %d", state->tx_port_idx, i);
                         break;
@@ -359,6 +367,10 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
                 state->last_obj_cnt = len;
                 state->num_queued += len;
                 if (port_can_xmit(state)) {
+                        if(!time_set){
+                                time_set = true;
+                                timer_start = bpf_ktime_get_ns();
+                        }
                         bpf_timer_start(&state->timer, 0 /* call asap */, 0);
                         // int r = bpf_timer_start(&state->timer, 0 /* call asap */, 0);
                         // debug_printk("forward_to_dst %d: Started BPF timer: %d", state->tx_port_idx, r);
@@ -381,6 +393,7 @@ int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
 
         pkt_len = BPF_CORE_READ(frm, len);
         metasize = BPF_CORE_READ(frm, metasize);
+        debug_printk("xdp_check_return: started %dB", pkt_len);
         if (metasize != sizeof(meta))
                 goto out;
 
@@ -400,6 +413,7 @@ int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
 
         can_xmit = port_can_xmit(state);
         state->outstanding_bytes -= pkt_len;
+        debug_printk("xdp_check_return: completed %dB", pkt_len);
 
         if (!can_xmit && port_can_xmit(state))
                 bpf_timer_start(&state->timer, 0, 0);

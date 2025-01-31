@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
 
 #include <bpf/libbpf.h>
 #include <xdp/libxdp.h>
@@ -140,7 +142,10 @@ static int do_load(const void *cfg, __unused const char *pin_root_path)
 {
 	struct xdp_program *xdp_prog = NULL, *init_prog = NULL;
 	DECLARE_LIBBPF_OPTS(xdp_program_opts, opts);
+	struct bpf_program *return_prog = NULL;
 	const struct load_opts *opt = cfg;
+	struct bpf_link *link = NULL;
+	char pin_link_path[PATH_MAX];
 	struct xdp_forward *skel;
 	int ret = EXIT_FAILURE;
 	struct iface *iface;
@@ -180,62 +185,6 @@ static int do_load(const void *cfg, __unused const char *pin_root_path)
 		goto end_destroy;
 	}
 
-	////////////////////////////////////////////////////////////////////////
-	// Idea 1: Load xdp_check_return as XDP program
-	// Problem: How to attach XDP program to tracepoint?
-	////////////////////////////////////////////////////////////////////////
-
-	// struct xdp_program *return_prog = NULL;
-	// opts.prog_name = "xdp_check_return";
-	// return_prog = xdp_program__create(&opts);
-	// if (!init_prog) {
-	// 	ret = -errno;
-	// 	pr_warn("Couldn't open XDP program: %s\n",
-	// 		strerror(-ret));
-	// 	goto end_destroy;
-	// }
-
-	// int tp_ifindex = -1;
-	// ret = xdp_program__attach(return_prog, tp_ifindex, opt->xdp_mode, 0);
-	// if (ret) {
-	// 	pr_warn("Couldn't attach to xdp_frame_return: %s\n",
-	// 		strerror(-ret));
-	// 	goto end_destroy;
-	// }
-
-	////////////////////////////////////////////////////////////////////////
-	// Idea 2: Load xdp_check_return as BPF program
-	// Problem: xdp_program_attach to interface fails: invalid argument
-	////////////////////////////////////////////////////////////////////////
-
-	struct bpf_program *return_prog = NULL;
-	struct bpf_link *link;
-
-	ret = bpf_object__load(skel->obj);
-	if (ret) {
-		pr_warn("Failed loading BPF-OBJ (%d): %s\n",
-				ret, strerror(-ret));
-		goto end_destroy;
-	}
-
-	return_prog = bpf_object__find_program_by_name(skel->obj,"xdp_check_return");
-	if (!return_prog) {
-		pr_warn("Failed to find xdp_check_return program\n");
-		goto end_destroy;
-	}
-
-	link = bpf_program__attach_raw_tracepoint(return_prog, "xdp_frame_return");
-	if (libbpf_get_error((const void *) link)) {
-		pr_warn("Couldn't attach to xdp_frame_return: %s\n",
-			strerror(libbpf_get_error((const void *) link)));
-		goto end_destroy;
-	}
-	skel->links.xdp_check_return = link;
-
-	////////////////////////////////////////////////////////////////////////
-	// End of attaching to tracepoint
-	////////////////////////////////////////////////////////////////////////
-
 	/* We always set the frags support bit: nothing the program does is
 	 * incompatible with multibuf, and it's perfectly fine to load a program
 	 * with frags support on an interface with a small MTU. We don't risk
@@ -273,6 +222,34 @@ static int do_load(const void *cfg, __unused const char *pin_root_path)
 		pr_info("Loaded on interface %s\n", iface->ifname);
 	}
 
+	/* Attach xdp_check_return to xdp_frame_return tracepoint and
+	 * pin the link to pin_root_path/xdp_check_return.
+	 */
+
+	return_prog = bpf_object__find_program_by_name(skel->obj,"xdp_check_return");
+	if (!return_prog) {
+		pr_warn("Failed to find xdp_check_return program\n");
+		goto end_detach;
+	}
+
+	link = bpf_program__attach_raw_tracepoint(return_prog, "xdp_frame_return");
+	if (libbpf_get_error((const void *) link)) {
+		pr_warn("Couldn't attach to xdp_frame_return: %s\n",
+			strerror(libbpf_get_error((const void *) link)));
+		goto end_detach;
+	}
+	skel->links.xdp_check_return = link;
+
+	snprintf(pin_link_path, sizeof(pin_link_path), "%s/%s", pin_root_path,
+			 "xdp_check_return");
+	ret = bpf_link__pin(link, pin_link_path);
+	if (ret) {
+		pr_warn("Failed to pin link: %s\n",
+			strerror(errno));
+		goto end_detach;
+	}
+	pr_info("Pinned xdp_check_return to %s\n", pin_link_path);
+
 end_destroy:
 	xdp_forward__destroy(skel);
 end:
@@ -281,6 +258,10 @@ end:
 end_detach:
 	for (iface = opt->ifaces; iface; iface = iface->next)
 		xdp_program__detach(xdp_prog, iface->ifindex, opt->xdp_mode, 0);
+	
+	bpf_link__unpin(link);
+	bpf_link__destroy(link);
+
 	goto end_destroy;
 }
 
@@ -302,6 +283,8 @@ struct prog_option unload_options[] = {
 static int do_unload(const void *cfg, __unused const char *pin_root_path)
 {
 	const struct unload_opts *opt = cfg;
+	struct bpf_link *link = NULL;
+	char pin_link_path[PATH_MAX];
 	int ret = EXIT_SUCCESS;
 	struct iface *iface;
 
@@ -312,6 +295,24 @@ static int do_unload(const void *cfg, __unused const char *pin_root_path)
 			ret = EXIT_FAILURE;
 		}
 		pr_info("Unloaded from interface %s\n", iface->ifname);
+	}
+
+	snprintf(pin_link_path, sizeof(pin_link_path), "%s/%s", pin_root_path,
+			 "xdp_check_return");
+
+	link = bpf_link__open(pin_link_path);
+	ret = bpf_link__unpin(link);
+	if(ret){
+		pr_warn("Couldn't unpin link\n");
+	} else {
+		pr_info("Unpinned link from %s\n", pin_link_path);
+	}
+
+	ret = bpf_link__destroy(link);
+	if(ret){
+		pr_warn("Couldn't destroy link\n");
+	} else {
+		pr_info("Destroyed link\n");
 	}
 
 	return ret;

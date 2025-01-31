@@ -384,6 +384,7 @@ SEC("raw_tracepoint/xdp_frame_return")
 int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
 {
         struct xdp_frame *frm = (struct xdp_frame *)ctx->args[0];
+        __u16 bulk_remaining = ctx->args[1];
         struct port_state *state;
         struct meta_val meta;
         __u32 metasize;
@@ -391,25 +392,44 @@ int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
         bool can_xmit;
         void *data;
 
+        debug_printk("xdp_check_return: bulk_remaining %d", bulk_remaining);
+	__u16 headroom;
+        __u32 frame_sz;
+	__u32 flags;
+
         pkt_len = BPF_CORE_READ(frm, len);
+        debug_printk("xdp_check_return: frm.len      %d", pkt_len);
+        headroom = BPF_CORE_READ(frm, headroom);
+        debug_printk("xdp_check_return: frm.headroom %d", headroom);
         metasize = BPF_CORE_READ(frm, metasize);
-        debug_printk("xdp_check_return: started %dB", pkt_len);
+        debug_printk("xdp_check_return: frm.metasize %d, sizeof(meta)=%d", metasize, sizeof(meta));
+        frame_sz = BPF_CORE_READ(frm, frame_sz);
+        debug_printk("xdp_check_return: frm.frame_sz %d", frame_sz);
+        flags = BPF_CORE_READ(frm, flags);
+        debug_printk("xdp_check_return: frm.flags    %d", flags);
+
+
         if (metasize != sizeof(meta))
                 goto out;
+        debug_printk("xdp_check_return: metasize match");
 
         data = BPF_CORE_READ(frm, data);
         if (!data)
                 goto out;
+        debug_printk("xdp_check_return: data exists");
 
-        if (bpf_probe_read_kernel(&meta, sizeof(meta), data-metasize))
+        if (bpf_probe_read_kernel(&meta, sizeof(meta), data-sizeof(meta)))
                 goto out;
+        debug_printk("xdp_check_return: successfully read meta");
 
         if (meta.cookie != META_COOKIE_VAL)
                 goto out;
+        debug_printk("xdp_check_return: meta.cookie match");
 
         state = bpf_map_lookup_elem(&dst_port_state, &meta.state_key);
         if (!state)
                 goto out;
+        debug_printk("xdp_check_return: state exists");
 
         can_xmit = port_can_xmit(state);
         state->outstanding_bytes -= pkt_len;

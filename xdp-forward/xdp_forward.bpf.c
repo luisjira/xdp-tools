@@ -41,7 +41,8 @@
 
 /* DQL: Define static maximums and some operations */
 #define HZ 1000
-#define JIFFIES (bpf_ktime_get_ns() / (1000000000 / HZ))
+// #define JIFFIES (bpf_ktime_get_ns() / (1000000000 / HZ))
+#define JIFFIES (bpf_jiffies64())
 #define U32_MAX ((__u32) -1)
 
 #define POSDIFF(A, B) ((A) > (B) ? (A) - (B) : 0)
@@ -112,6 +113,7 @@ struct {
 // TODO remove
 bool time_set = false;
 __u64 timer_start;
+__u16 bulk_seen;
 
 static int dql_completed(struct port_state *state, __u32 count)
 {
@@ -156,7 +158,7 @@ static int dql_completed(struct port_state *state, __u32 count)
 		 */
 		limit += POSDIFF(completed, state->prev_num_queued) +
 		     state->prev_ovlimit;
-                debug_printk("dql_completed %d: queue starved, new limit %u, POSDIFF %u, prev_ovlimit %u",state->tx_port_idx, limit, POSDIFF(completed, state->prev_num_queued), state->prev_ovlimit);
+                debug_printk("dql_completed %u: queue starved, new limit %u, POSDIFF %u, prev_ovlimit %u",state->tx_port_idx, limit, POSDIFF(completed, state->prev_num_queued), state->prev_ovlimit);
 		state->slack_start_time = JIFFIES;
 		state->lowest_slack = U32_MAX;
 	} else if (inprogress && prev_inprogress && !all_prev_completed) {
@@ -196,9 +198,9 @@ static int dql_completed(struct port_state *state, __u32 count)
 
                 /* Check if current time past slack_start + slack_hold*/
 		if ((JIFFIES >= (state->slack_start_time + state->slack_hold_time))) {
-                        debug_printk("dql_completed %d: queue not starved, limit %u, lowest_slack %u",state->tx_port_idx, limit, state->lowest_slack);
+                        debug_printk("dql_completed %u: queue not starved, limit %u, lowest_slack %u",state->tx_port_idx, limit, state->lowest_slack);
 			limit = POSDIFF(limit, state->lowest_slack);
-                        debug_printk("dql_completed %d: queue not starved, new limit %u", state->tx_port_idx, limit);
+                        debug_printk("dql_completed %u: queue not starved, new limit %u", state->tx_port_idx, limit);
 			state->slack_start_time = JIFFIES;
 			state->lowest_slack = U32_MAX;
 		}
@@ -222,7 +224,7 @@ static int dql_completed(struct port_state *state, __u32 count)
 	state->num_completed = completed;
 	state->prev_num_queued = num_queued;
 
-        debug_printk("dql_completed %d: limit %u, adj_limit %u, prev_num_queued %u, prev_ovlimit %u\n",
+        debug_printk("dql_completed %u: limit %u, adj_limit %u, prev_num_queued %u, prev_ovlimit %u\n",
                 state->tx_port_idx, limit, state->adj_limit, num_queued, ovlimit);
         
         return 0;
@@ -234,13 +236,11 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
         struct xdp_frame *pkt;
         int i, tgt_ifindex;
         __u64 index;
-        __u32 count = 0;
 
         state = bpf_map_lookup_elem(map, key);
         if (!state) {
                 debug_printk("xdp_timer_cb: No state found for key %lu", *key);
-                // goto out;
-                return 0;
+                goto out;
         }
 
         // debug_printk("xdp_timer_cb %d: key %lu", state->tx_port_idx, *key);
@@ -249,17 +249,28 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
         tgt_ifindex = (*key) & IFINDEX_MASK;
         // debug_printk("xdp_timer_cb %d: tgt_ifindex %d tx_port_idx %lu", index, tgt_ifindex, index);
 
+        // TODO check available space in tx_queue
+        if(state->adj_limit < state->num_queued){
+                debug_printk("forward_to_dst %u: not enough space", state->tx_port_idx);
+                return XDP_DROP;
+        }
+
         for (i = 0; i < TX_BATCH_SIZE; i++) {
                 pkt = xdp_packet_dequeue(MAP_PTR(xdp_queues), index, NULL);
                 if (time_set) {
-                        debug_printk("xdp_timer_cb %d: callback time %d", state->tx_port_idx, bpf_ktime_get_ns() - timer_start);
+                        debug_printk("xdp_timer_cb %u: callback time %u", state->tx_port_idx, bpf_ktime_get_ns() - timer_start);
                         time_set = false;
                 }
                 if (!pkt) {
-                        debug_printk("xdp_timer_cb %d: No packet returned at iteration %d", state->tx_port_idx, i);
+                        debug_printk("xdp_timer_cb %u: No packet returned at iteration %d", state->tx_port_idx, i);
                         break;
                 }
-                count += pkt->len;
+                // TODO remove debugging prints
+                debug_printk("xdp_timer_cb: frm.len      %u", pkt->len);
+                debug_printk("xdp_timer_cb: frm.headroom %u", pkt->headroom);
+                debug_printk("xdp_timer_cb: frm.metasize %u", pkt->metasize);
+                debug_printk("xdp_timer_cb: frm.frame_sz %u", pkt->frame_sz);
+                debug_printk("xdp_timer_cb: frm.flags    %u", pkt->flags);
 
                 // debug_printk("xdp_timer_cb %d: Sending to ifindex %d", state->tx_port_idx, tgt_ifindex),;
                 xdp_packet_send(pkt, tgt_ifindex, 0);
@@ -267,10 +278,8 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
 
         xdp_packet_flush();
 
-        // TODO dql_completed
-        return dql_completed(state, count);
-//out:      
-//        return 0;
+out:      
+        return 0;
 }
 
 static __u32 next_port_idx = 0;
@@ -321,7 +330,7 @@ static __always_inline bool forward_dst_enabled(int ifindex)
 
 static bool port_can_xmit(struct port_state *state)
 {
-        return state->outstanding_bytes < PORT_QUEUE_THRESHOLD;
+        return state->outstanding_bytes < DQL_MAX_LIMIT;
 }
 
 static int forward_to_dst(struct xdp_md *ctx, int ifindex)
@@ -355,10 +364,10 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
         /* TODO check for packet length? */
         // debug_printk("========== New packet to XDP queue %d ==========", state->tx_port_idx);
         // debug_printk("forward_to_dst %d: checking space with adj_limit %u num_queued %u len %u", state->tx_port_idx, state->adj_limit, state->num_queued, len);
-        if(state->adj_limit < state->num_queued){
-                debug_printk("forward_to_dst %d: not enough space", state->tx_port_idx);
-                return XDP_DROP;
-        }
+        // if(state->adj_limit < state->num_queued){
+        //         debug_printk("forward_to_dst %d: not enough space", state->tx_port_idx);
+        //         return XDP_DROP;
+        // }
 
         ret = bpf_redirect_map(&xdp_queues, state->tx_port_idx, 0);
 
@@ -392,22 +401,23 @@ int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
         bool can_xmit;
         void *data;
 
-        debug_printk("xdp_check_return: bulk_remaining %d", bulk_remaining);
+        bulk_seen += bulk_remaining;
+
+        debug_printk("xdp_check_return: bulk_remaining %u bulk_seen %u", bulk_remaining, bulk_seen);
 	__u16 headroom;
         __u32 frame_sz;
 	__u32 flags;
 
         pkt_len = BPF_CORE_READ(frm, len);
-        debug_printk("xdp_check_return: frm.len      %d", pkt_len);
+        debug_printk("xdp_check_return: frm.len      %u", pkt_len);
         headroom = BPF_CORE_READ(frm, headroom);
-        debug_printk("xdp_check_return: frm.headroom %d", headroom);
+        debug_printk("xdp_check_return: frm.headroom %u", headroom);
         metasize = BPF_CORE_READ(frm, metasize);
-        debug_printk("xdp_check_return: frm.metasize %d, sizeof(meta)=%d", metasize, sizeof(meta));
+        debug_printk("xdp_check_return: frm.metasize %u, sizeof(meta)=%d", metasize, sizeof(meta));
         frame_sz = BPF_CORE_READ(frm, frame_sz);
-        debug_printk("xdp_check_return: frm.frame_sz %d", frame_sz);
+        debug_printk("xdp_check_return: frm.frame_sz %u", frame_sz);
         flags = BPF_CORE_READ(frm, flags);
-        debug_printk("xdp_check_return: frm.flags    %d", flags);
-
+        debug_printk("xdp_check_return: frm.flags    %u", flags);
 
         if (metasize != sizeof(meta))
                 goto out;
@@ -433,7 +443,8 @@ int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
 
         can_xmit = port_can_xmit(state);
         state->outstanding_bytes -= pkt_len;
-        debug_printk("xdp_check_return: completed %dB", pkt_len);
+        return dql_completed(state, pkt_len);
+        debug_printk("xdp_check_return: completed %uB", pkt_len);
 
         if (!can_xmit && port_can_xmit(state))
                 bpf_timer_start(&state->timer, 0, 0);

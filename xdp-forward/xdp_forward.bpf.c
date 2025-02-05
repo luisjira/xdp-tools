@@ -240,7 +240,8 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
         state = bpf_map_lookup_elem(map, key);
         if (!state) {
                 debug_printk("xdp_timer_cb: No state found for key %lu", *key);
-                goto out;
+                // goto out;
+                return 0;
         }
 
         // debug_printk("xdp_timer_cb %d: key %lu", state->tx_port_idx, *key);
@@ -252,7 +253,9 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
         // TODO check available space in tx_queue
         if(state->adj_limit < state->num_queued){
                 debug_printk("forward_to_dst %u: not enough space", state->tx_port_idx);
-                return XDP_DROP;
+                // return XDP_DROP;
+                // TODO abort dequeuing
+                return 0;
         }
 
         for (i = 0; i < TX_BATCH_SIZE; i++) {
@@ -278,7 +281,7 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
 
         xdp_packet_flush();
 
-out:      
+// out:      
         return 0;
 }
 

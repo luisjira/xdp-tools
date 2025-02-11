@@ -125,7 +125,8 @@ static int dql_completed(struct port_state *state, __u32 count)
 
 	/* Can't complete more than what's in queue */
 	if(count > num_queued - state->num_completed) {
-                // debug_printk("dql_completed %d: Completing more than queued", state->tx_port_idx);
+                debug_printk("dql_completed %d: Completing more than queued count %u, num_queued %u, num_completed %u", state->tx_port_idx, count, num_queued, state->num_completed);
+
                 // TODO make negative since this is an error
                 return 0;
         }
@@ -139,6 +140,7 @@ static int dql_completed(struct port_state *state, __u32 count)
 
         // debug_printk("dql_completed %d: ovlimit %u, inprogress %u, prev_ovlimit %u, all_prev_completed %u, prev_inprogress %u", state->tx_port_idx, ovlimit, inprogress, state->prev_ovlimit, all_prev_completed, prev_inprogress);
 
+        // debug_printk("dql_completed %d: ovlimit inprogress prev_ovlimit allPprev_completedCompleting more than queued count %u, num_queued %u, num_completed %u", state->tx_port_idx, count, num_queued, state->num_completed);
 	if ((ovlimit && !inprogress) ||
 	    (state->prev_ovlimit && all_prev_completed)) {
 		/*
@@ -252,7 +254,7 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
 
         // TODO check available space in tx_queue
         if(state->adj_limit < state->num_queued){
-                debug_printk("forward_to_dst %u: not enough space", state->tx_port_idx);
+                debug_printk("xdp_timer_cb %u: not enough space", index);
                 // return XDP_DROP;
                 // TODO abort dequeuing
                 return 0;
@@ -269,14 +271,17 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
                         break;
                 }
                 // TODO remove debugging prints
-                debug_printk("xdp_timer_cb: frm.len      %u", pkt->len);
-                debug_printk("xdp_timer_cb: frm.headroom %u", pkt->headroom);
-                debug_printk("xdp_timer_cb: frm.metasize %u", pkt->metasize);
-                debug_printk("xdp_timer_cb: frm.frame_sz %u", pkt->frame_sz);
-                debug_printk("xdp_timer_cb: frm.flags    %u", pkt->flags);
+                debug_printk("xdp_timer_cb %u: frm.len      %u", index, pkt->len);
+                debug_printk("xdp_timer_cb %u: frm.headroom %u", index, pkt->headroom);
+                debug_printk("xdp_timer_cb %u: frm.metasize %u", index, pkt->metasize);
+                debug_printk("xdp_timer_cb %u: frm.frame_sz %u", index, pkt->frame_sz);
+                debug_printk("xdp_timer_cb %u: frm.flags    %u", index, pkt->flags);
 
                 // debug_printk("xdp_timer_cb %d: Sending to ifindex %d", state->tx_port_idx, tgt_ifindex),;
                 xdp_packet_send(pkt, tgt_ifindex, 0);
+                /* Use data length as packet length */
+                state->last_obj_cnt = pkt->len;
+                state->num_queued += pkt->len;
         }
 
         xdp_packet_flush();
@@ -341,7 +346,7 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
         __u32 cpu = bpf_get_smp_processor_id();
         __u64 state_key = STATE_KEY(cpu, ifindex);
         struct port_state *state;
-        __u32 len = ctx->data_end - ctx->data;
+        // __u32 len = ctx->data_end - ctx->data;
         void *data, *data_meta;
         struct meta_val *mval;
         int ret;
@@ -375,9 +380,6 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
         ret = bpf_redirect_map(&xdp_queues, state->tx_port_idx, 0);
 
         if (ret == XDP_REDIRECT) {
-                /* Use data length as packet length */
-                state->last_obj_cnt = len;
-                state->num_queued += len;
                 if (port_can_xmit(state)) {
                         if(!time_set){
                                 time_set = true;

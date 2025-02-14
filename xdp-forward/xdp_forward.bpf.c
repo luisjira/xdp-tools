@@ -28,7 +28,7 @@
 #define META_COOKIE_VAL 0x4242424242424242UL
 
 #define MAX_TX_PORTS 64
-#define TX_BATCH_SIZE 256
+#define TX_BATCH_SIZE 512
 
 #define IFINDEX_MASK 0xFFFFFFFF
 #define STATE_KEY(cpu, ifindex) (((__u64)cpu << 32) + ifindex)
@@ -115,6 +115,8 @@ static bool port_can_xmit(struct port_state *state)
         return state->outstanding_bytes < DQL_MAX_LIMIT;
 }
 
+// int max_i=0;
+
 static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer)
 {
         struct port_state *state;
@@ -135,7 +137,8 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
                 pkt = xdp_packet_dequeue(MAP_PTR(xdp_queues), index, NULL);
 
                 if (!pkt) {
-                        debug_printk("xdp_timer_cb %u: No packet returned at iteration %d", state->tx_port_idx, i);
+                        // if (i > max_i) max_i = i;
+                        // debug_printk("xdp_timer_cb %u: No packet returned at iteration %d max_seen %d", state->tx_port_idx, i, max_i);
                         break;
                 }
 
@@ -143,7 +146,7 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
                 state->outstanding_bytes += pkt->len;
         }
 
-        debug_printk("xdp_timer_cb %u: outstanding_bytes %u", state->tx_port_idx, state->outstanding_bytes);
+        // debug_printk("xdp_timer_cb %u: outstanding_bytes %u", state->tx_port_idx, state->outstanding_bytes);
         xdp_packet_flush();
 
 out:      
@@ -240,6 +243,7 @@ SEC("raw_tracepoint/xdp_frame_return")
 int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
 {
         struct xdp_frame *frm = (struct xdp_frame *)ctx->args[0];
+        // __u16 bulk_remaining = ctx->args[1];
         struct port_state *state;
         struct meta_val meta;
         __u32 metasize;
@@ -268,6 +272,7 @@ int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
 
         can_xmit = port_can_xmit(state);
         state->outstanding_bytes = POSDIFF(state->outstanding_bytes, pkt_len);
+        // debug_printk("xdp_check_return %u: outstanding_bytes %u bulk_remaining %u, DQL_LIMIT %u", state->tx_port_idx, state->outstanding_bytes, bulk_remaining, DQL_MAX_LIMIT);
 
         if (!can_xmit && port_can_xmit(state))
                 bpf_timer_start(&state->timer, 0, 0);

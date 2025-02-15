@@ -460,6 +460,9 @@ int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
         can_queue = dql_avail(state) >= 0;
         state->returned += pkt_len;
 
+
+        debug_printk("xdp_check_return %u: bulk_remaining %u", 
+                             state->tx_port_idx, bulk_remaining);
         // Don't execute dql_completed for every single packet
         if (bulk_remaining == 0) {
                 debug_printk("xdp_check_return %u: calling dql_completed", 

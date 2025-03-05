@@ -593,10 +593,21 @@ static __always_inline int xdp_fwd_flags(struct xdp_md *ctx, __u32 flags)
                 if (!forward_dst_enabled(fib_params.ifindex))
                         return XDP_PASS;
 
-                if (h_proto == bpf_htons(ETH_P_IP))
+                              if (!forward_dst_enabled(fib_params.ifindex))
+                        return XDP_PASS;
+
+                if (h_proto == bpf_htons(ETH_P_IP)) {
                         ip_decrease_ttl(iph);
-                else if (h_proto == bpf_htons(ETH_P_IPV6))
+                        if (iph->protocol == IPPROTO_ICMP) {
+                                return XDP_REDIRECT;
+                        }
+                }
+                else if (h_proto == bpf_htons(ETH_P_IPV6)) {
                         ip6h->hop_limit--;
+                        if (ip6h->nexthdr == IPPROTO_ICMPV6) {
+                                return XDP_REDIRECT;
+                        }
+                }
 
                 __builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
                 __builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);

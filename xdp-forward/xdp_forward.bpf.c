@@ -383,6 +383,7 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
         void *data, *data_meta;
         struct meta_val *mval;
         int ret;
+        debug_printk("========== New packet to XDP ==========");
 
         state = bpf_map_lookup_elem(&dst_port_state, &state_key);
         if (!state)
@@ -401,7 +402,7 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
         mval->state_key = state_key;
         mval->cookie = META_COOKIE_VAL;
         
-        // debug_printk("========== New packet to XDP queue %d ==========", state->tx_port_idx);
+        debug_printk("========== New packet to XDP queue %d ==========", state->tx_port_idx);
 
         // TODO should this be here or in the callback?
         // if (dql_avail(state) < 0) {
@@ -412,6 +413,7 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
         ret = bpf_redirect_map(&xdp_queues, state->tx_port_idx, 0);
 
         if (ret == XDP_REDIRECT) {
+                debug_printk("fwd_to_dst %u: Redirecting", state->tx_port_idx);
                 // TODO remove callback timing code
                 // if(!time_set){
                 //         time_set = true;

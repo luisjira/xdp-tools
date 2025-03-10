@@ -146,6 +146,7 @@ static int do_load(const void *cfg, __unused const char *pin_root_path)
 	const struct load_opts *opt = cfg;
 	struct bpf_link *link = NULL;
 	char pin_link_path[PATH_MAX];
+	struct bpf_map *devmap = NULL;
 	struct xdp_forward *skel;
 	int ret = EXIT_FAILURE;
 	struct iface *iface;
@@ -166,6 +167,8 @@ static int do_load(const void *cfg, __unused const char *pin_root_path)
 		pr_warn("Failed to load skeleton: %s\n", strerror(errno));
 		goto end;
 	}
+
+	devmap = skel->maps.xdp_tx_ports;
 
 	opts.obj = skel->obj;
 	xdp_prog = xdp_program__create(&opts);
@@ -215,6 +218,14 @@ static int do_load(const void *cfg, __unused const char *pin_root_path)
 		ret = init_tx_port(init_prog, iface->ifindex);
 		if (ret) {
 			pr_warn("Failed to initiate TX port: %s\n",
+				strerror(errno));
+			goto end_detach;
+		}
+
+		ret = bpf_map_update_elem(bpf_map__fd(devmap), &iface->ifindex,
+					  &iface->ifindex, 0);
+		if (ret) {
+			pr_warn("Failed to update devmap value: %s\n",
 				strerror(errno));
 			goto end_detach;
 		}

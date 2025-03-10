@@ -606,39 +606,17 @@ static __always_inline int xdp_fwd_flags(struct xdp_md *ctx, __u32 flags)
                 if (h_proto == bpf_htons(ETH_P_IP)) {
                         ip_decrease_ttl(iph);
                         if (iph->protocol == IPPROTO_ICMP) {
-                                struct bpf_devmap_val *v = bpf_map_lookup_elem(&xdp_tx_ports, &fib_params.ifindex);
-                                if (v != NULL) {
-                                        // bpf_printk("ICMP prio ifindex %d", v->ifindex);
-                                        bpf_printk("ICMP prio ifindex");
-                                } else {
-                                        bpf_printk("NULL");
-                                }
-                                long ret;
                                 __builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
 		                __builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
-		                ret = bpf_redirect_map(&xdp_tx_ports, fib_params.ifindex, 0);
-                                if (ret == XDP_REDIRECT)
-                                        bpf_printk("REDIRECT");
-                                return ret;
+		                return bpf_redirect_map(&xdp_tx_ports, fib_params.ifindex, 0);
                         }
                 }
                 else if (h_proto == bpf_htons(ETH_P_IPV6)) {
                         ip6h->hop_limit--;
                         if (ip6h->nexthdr == IPPROTO_ICMPV6) {
-                                struct bpf_devmap_val *v = bpf_map_lookup_elem(&xdp_tx_ports, &fib_params.ifindex);
-                                if (v != NULL) {
-                                        // bpf_printk("ICMP prio ifindex %d", v->ifindex);
-                                        bpf_printk("ICMP prio ifindex");
-                                } else {
-                                        bpf_printk("NULL");
-                                }
-                                long ret;
                                 __builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
 		                __builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
-		                ret = bpf_redirect_map(&xdp_tx_ports, fib_params.ifindex, 0);
-                                if (ret == XDP_REDIRECT)
-                                        bpf_printk("REDIRECT");
-                                return ret;
+		                return bpf_redirect_map(&xdp_tx_ports, fib_params.ifindex, 0);
                         }
                 }
 

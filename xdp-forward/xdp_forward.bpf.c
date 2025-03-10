@@ -44,15 +44,14 @@
 #define HZ 1000
 // #define JIFFIES (bpf_ktime_get_ns() / (1000000000 / HZ))
 #define JIFFIES (bpf_jiffies64())
-#define U32_MAX ((__u32) -1)
+#define U64_MAX ((__u64) -1)
 
 #define POSDIFF(A, B) ((A) > (B) ? (A) - (B) : 0)
-#define AFTER_EQ(A, B) ((__s32)((A) - (B)) >= 0)
 #define MAX(A,B) (A > B ? A : B)
 #define CLAMP(x,lo,hi) (x > hi ? hi : (x < lo ? lo : x))
 
-#define DQL_MAX_OBJECT (U32_MAX / 16)
-#define DQL_MAX_LIMIT  ((U32_MAX / 2) - DQL_MAX_OBJECT)
+#define DQL_MAX_OBJECT (U64_MAX / 16)
+#define DQL_MAX_LIMIT  ((U64_MAX / 2) - DQL_MAX_OBJECT)
 
 extern struct xdp_frame *xdp_packet_dequeue(struct bpf_map *map, __u64 flags,
                                             __u64 *rank) __ksym;
@@ -64,31 +63,30 @@ extern int bpf_dynptr_from_xdp_frame(struct xdp_frame *xdp, __u64 flags,
 
 struct port_state {
         struct bpf_timer timer;
-        __u32 tx_port_idx;
-        __u32 returned;                 /* Track bytes of returned frames */
+        __u32   tx_port_idx;
+        __u64   bulk_cnt;               /* Track bytes of completed frames */
 
         /* DQL STATE */
         /* Fields accessed in enqueue path (dql_queued) */
-        __u32	num_queued;		/* Total ever queued */
-        __u32	adj_limit;		/* limit + num_completed */
-        __u32	last_obj_cnt;		/* Count at last queuing */
+        __u64	num_queued;		/* Total ever queued */
+        __u64	adj_limit;		/* limit + num_completed */
+        __u64	last_obj_cnt;		/* Count at last queuing */
 
         /* Fields accessed only by completion path (dql_completed) */
+        __u64	limit;                  /* Current limit, was aligned*/
+        __u64	num_completed;		/* Total ever completed */
 
-        __u32	limit;                  /* Current limit, was aligned*/
-        __u32	num_completed;		/* Total ever completed */
+        __u64	prev_ovlimit;		/* Previous over limit */
+        __u64	prev_num_queued;	/* Previous queue total */
+        __u64	prev_last_obj_cnt;	/* Previous queuing cnt */
 
-        __u32	prev_ovlimit;		/* Previous over limit */
-        __u32	prev_num_queued;	/* Previous queue total */
-        __u32	prev_last_obj_cnt;	/* Previous queuing cnt */
-
-        __u32	lowest_slack;		/* Lowest slack found */
+        __u64	lowest_slack;		/* Lowest slack found */
         __u64	slack_start_time;	/* Time slacks seen */
 
         /* Configuration */
-        __u32	max_limit;		/* Max limit */
-        __u32	min_limit;		/* Minimum limit */
-        __u32	slack_hold_time;	/* Time to measure slack */
+        __u64	max_limit;		/* Max limit */
+        __u64	min_limit;		/* Minimum limit */
+        __u64	slack_hold_time;	/* Time to measure slack */
 };
 
 struct meta_val {
@@ -125,11 +123,8 @@ static int dql_avail(struct port_state *state)
         return state->adj_limit - state->num_queued;
 }
 
-/*
- * Record number of objects queued. Assumes that caller has already checked
- * availability in the queue with dql_avail.
- */
-static inline void dql_queued(struct port_state *state, unsigned int count)
+/* Record number of objects queued. Assumes availability has been checked */
+static inline void dql_queued(struct port_state *state, __u64 count)
 {
 	if (count > DQL_MAX_OBJECT) {
                 debug_printk("dql_queued %d: ERROR: count too large", state->tx_port_idx);
@@ -148,24 +143,51 @@ static inline void dql_queued(struct port_state *state, unsigned int count)
 	state->num_queued += count;
 }
 
+/* Reset all dynamic values */
+static inline void dql_reset(struct port_state *state)
+{
+	state->limit = 0;
+	state->num_queued = 0;
+	state->num_completed = 0;
+	state->last_obj_cnt = 0;
+	state->prev_num_queued = 0;
+	state->prev_last_obj_cnt = 0;
+	state->prev_ovlimit = 0;
+	state->lowest_slack = U64_MAX;
+	state->slack_start_time = JIFFIES;
+}
+
 /* Records completed count and recalculates the queue limit */
 static int dql_completed(struct port_state *state)
 {
-        __u32 count, inprogress, prev_inprogress, limit;
-	__u32 ovlimit, completed, num_completed, num_queued;
+        __u64 count, inprogress, prev_inprogress, limit;
+	__u64 ovlimit, completed, num_completed, num_queued;
 	bool all_prev_completed;
 
-        count = state->returned;
-        state->returned = 0;
+        count = state->bulk_cnt;
+        state->bulk_cnt = 0;
 	num_queued = state->num_queued;
         num_completed = state->num_completed;
 
+        /* Reset state before overflow */
+        if(num_queued > (U64_MAX >> 1)){
+                // TODO remove
+                bpf_printk("dql_completed %d: RESET ======================",
+                             state->tx_port_idx);
+
+                dql_reset(state);
+                return 0;
+        }
+
 	/* Can't complete more than what's in queue */
 	if(count > num_queued - num_completed) {
-                debug_printk("dql_completed %d: Completing more than queued count %u > num_queued %u - num_completed %u", state->tx_port_idx, count, num_queued, state->num_completed);
+                debug_printk("dql_completed %d: Completing more than queued count %u > num_queued %u - num_completed %u",
+                                state->tx_port_idx,
+                                count,
+                                num_queued,
+                                state->num_completed);
 
-                // TODO make negative since this is an error
-                return 0;
+                return -1;
         }
 
 	completed = num_completed + count;
@@ -173,9 +195,8 @@ static int dql_completed(struct port_state *state)
 	ovlimit = POSDIFF(num_queued - num_completed, limit);
 	inprogress = num_queued - completed;
 	prev_inprogress = state->prev_num_queued - num_completed;
-	all_prev_completed = AFTER_EQ(completed, state->prev_num_queued);
+	all_prev_completed = completed >= state->prev_num_queued;
 
-        // debug_printk("dql_completed %d: ovlimit %u, inprogress %u, prev_ovlimit %u, all_prev_completed %u, prev_inprogress %u", state->tx_port_idx, ovlimit, inprogress, state->prev_ovlimit, all_prev_completed, prev_inprogress);
 	if ((ovlimit && !inprogress) ||
 	    (state->prev_ovlimit && all_prev_completed)) {
 		/*
@@ -195,12 +216,13 @@ static int dql_completed(struct port_state *state)
 		 */
 		limit += POSDIFF(completed, state->prev_num_queued) +
 		     state->prev_ovlimit;
+		state->slack_start_time = JIFFIES;
+		state->lowest_slack = U64_MAX;
+
                 debug_printk("dql_completed %u: queue starved, new limit %u, POSDIFF %u, prev_ovlimit %u",
                              state->tx_port_idx, limit,
                              POSDIFF(completed, state->prev_num_queued),
                              state->prev_ovlimit);
-		state->slack_start_time = JIFFIES;
-		state->lowest_slack = U32_MAX;
 	} else if (inprogress && prev_inprogress && !all_prev_completed) {
 		/*
 		 * Queue was not starved, check if the limit can be decreased.
@@ -237,26 +259,23 @@ static int dql_completed(struct port_state *state)
 			state->lowest_slack = slack;
 
                 /* Check if current time past slack_start + slack_hold*/
-		if ((JIFFIES >= (state->slack_start_time + state->slack_hold_time))) {
-                        debug_printk("dql_completed %u: queue not starved, limit %u, lowest_slack %u",
+		if (JIFFIES >= state->slack_start_time + state->slack_hold_time) {
+                        debug_printk("dql_completed %u: decrease limit %u, lowest_slack %u",
                                      state->tx_port_idx, limit, state->lowest_slack);
 			limit = POSDIFF(limit, state->lowest_slack);
-                        debug_printk("dql_completed %u: queue not starved, new limit %u", 
-                                     state->tx_port_idx, limit);
 			state->slack_start_time = JIFFIES;
-			state->lowest_slack = U32_MAX;
+			state->lowest_slack = U64_MAX;
 		}
 	}
 
 	/* Enforce bounds on limit */
 	limit = CLAMP(limit,state->min_limit, state->max_limit);
 
-        // debug_printk("dql_completed %d: after bounds checking from %u set to %u", 
-        //              state->tx_port_idx, tmp, limit);
-
 	if (limit != state->limit) {
 		state->limit = limit;
 		ovlimit = 0;
+                debug_printk("dql_completed %u: new limit %u", 
+                        state->tx_port_idx, limit);
 	}
 
 	state->adj_limit = limit + completed;
@@ -264,9 +283,6 @@ static int dql_completed(struct port_state *state)
 	state->prev_last_obj_cnt = state->last_obj_cnt;
 	state->num_completed = completed;
 	state->prev_num_queued = num_queued;
-
-        debug_printk("dql_completed %u: limit %u, adj_limit %u, prev_num_queued %u, prev_ovlimit %u\n",
-                state->tx_port_idx, limit, state->adj_limit, num_queued, ovlimit);
         
         return 0;
 }
@@ -277,7 +293,7 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
         struct xdp_frame *pkt;
         int i, tgt_ifindex;
         int batch_size = TX_BATCH_SIZE;
-        int len_sum = 0;
+        __u64 len_sum = 0;
         __u64 index;
 
         state = bpf_map_lookup_elem(map, key);
@@ -321,8 +337,8 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
                 xdp_packet_send(pkt, tgt_ifindex, 0);
         }
 
-        dql_queued(state,len_sum);
         xdp_packet_flush();
+        dql_queued(state,len_sum);
 
 out:
         return 0;
@@ -340,13 +356,13 @@ static int init_tx_port(int ifindex, __u32 cpu)
                 return -E2BIG;
 
         new_state.tx_port_idx = next_port_idx++;
-        new_state.returned = 0;
+        new_state.bulk_cnt = 0;
         /* DQL: Initialize state */
         new_state.max_limit = DQL_MAX_LIMIT;
         new_state.min_limit = 0;
         new_state.adj_limit = new_state.min_limit;
         new_state.slack_hold_time = HZ;
-	new_state.lowest_slack = U32_MAX;
+	new_state.lowest_slack = U64_MAX;
 	new_state.slack_start_time = JIFFIES;
 
         ret = bpf_map_update_elem(&dst_port_state, &state_key, &new_state, 0);
@@ -451,20 +467,23 @@ int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
                 goto out;
 
         can_queue = dql_avail(state) >= 0;
-        state->returned += pkt_len;
+        state->bulk_cnt += pkt_len;
 
 
         debug_printk("xdp_check_return %u: bulk_remaining %u", 
                              state->tx_port_idx, bulk_remaining);
-        // Don't execute dql_completed for every single packet
+
+        /* Don't execute dql_completed for every single packet */
         if (bulk_remaining == 0) {
                 debug_printk("xdp_check_return %u: calling dql_completed", 
                              state->tx_port_idx);
                 dql_completed(state);
 
-                // Check again in case another CPU has just made room avail
-                // Only useful if running dql at xdp_queue dequeue
-                // Otherwise this does nothing
+                /* 
+                 * Check again in case another CPU has just made room available
+                 * Only useful if running dql at xdp_queue dequeue
+                 * Otherwise this does nothing
+                 */
                 if (!can_queue && (dql_avail(state) >= 0))
                         bpf_timer_start(&state->timer, 0, 0);
         }

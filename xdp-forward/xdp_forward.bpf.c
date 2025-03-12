@@ -145,7 +145,8 @@ static inline void dql_queued(struct port_state *state, __u64 count)
 	 * in Shared state, but directly does a Request For Ownership
 	 * It is only a hint, we use barrier() only.
 	 */
-	barrier();
+        // TODO remove or add back?
+	// barrier();
 
 	state->num_queued += count;
 }

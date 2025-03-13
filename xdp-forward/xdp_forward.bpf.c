@@ -66,6 +66,13 @@ struct {
 	__uint(map_extra, MAX_TX_PORTS);
 } xdp_queues SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_DEVMAP);
+	__uint(key_size, sizeof(int));
+	__uint(value_size, sizeof(int));
+	__uint(max_entries, 64);
+} xdp_tx_ports SEC(".maps");
+
 static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer)
 {
 	struct port_state *state;
@@ -323,10 +330,21 @@ static __always_inline int xdp_fwd_flags(struct xdp_md *ctx, __u32 flags)
 		if (!forward_dst_enabled(fib_params.ifindex))
 			return XDP_PASS;
 
-		if (h_proto == bpf_htons(ETH_P_IP))
+		if (h_proto == bpf_htons(ETH_P_IP)){
 			ip_decrease_ttl(iph);
-		else if (h_proto == bpf_htons(ETH_P_IPV6))
+                        if (iph->protocol == IPPROTO_ICMP) {
+                                __builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
+		                __builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
+		                return bpf_redirect_map(&xdp_tx_ports, fib_params.ifindex, 0);
+                        }
+                } else if (h_proto == bpf_htons(ETH_P_IPV6)) {
 			ip6h->hop_limit--;
+                        if (ip6h->nexthdr == IPPROTO_ICMPV6) {
+                                __builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
+		                __builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
+		                return bpf_redirect_map(&xdp_tx_ports, fib_params.ifindex, 0);
+                        }
+                }
 
 		__builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
 		__builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);

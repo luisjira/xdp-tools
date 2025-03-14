@@ -119,10 +119,21 @@ static __always_inline int xdp_fwd_flags(struct xdp_md *ctx, __u32 flags)
 		if (!bpf_map_lookup_elem(&xdp_tx_ports, &fib_params.ifindex))
 			return XDP_PASS;
 
-		if (h_proto == bpf_htons(ETH_P_IP))
+		if (h_proto == bpf_htons(ETH_P_IP)){
 			ip_decrease_ttl(iph);
-		else if (h_proto == bpf_htons(ETH_P_IPV6))
+                        if (iph->protocol == IPPROTO_ICMP) {
+                                __builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
+		                __builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
+		                return bpf_redirect_map(&xdp_tx_ports, fib_params.ifindex, 0);
+                        }
+                } else if (h_proto == bpf_htons(ETH_P_IPV6)) {
 			ip6h->hop_limit--;
+                        if (ip6h->nexthdr == IPPROTO_ICMPV6) {
+                                __builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
+		                __builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
+		                return bpf_redirect_map(&xdp_tx_ports, fib_params.ifindex, 0);
+                        }
+                }
 
 		__builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
 		__builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);

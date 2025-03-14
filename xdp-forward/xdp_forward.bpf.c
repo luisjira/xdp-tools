@@ -12,6 +12,14 @@
 
 #include "xdp-forward.h"
 
+#define DEBUG_PRINT 0 // Set to 1 for debugging, 0 to disable bpf_printk
+
+#if DEBUG_PRINT
+#define debug_printk(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__)
+#else
+#define debug_printk(fmt, ...)
+#endif
+
 #define AF_INET	2
 #define AF_INET6	10
 
@@ -80,26 +88,26 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
 	int i, tgt_ifindex;
 	__u64 index;
 
-	bpf_printk("BPF timer cb - key %lu\n", *key);
+	debug_printk("BPF timer cb - key %lu\n", *key);
 
 	state = bpf_map_lookup_elem(map, key);
 	if (!state) {
-		bpf_printk("xdp_timer_cb: No state found for key %lu\n", *key);
+		debug_printk("xdp_timer_cb: No state found for key %lu\n", *key);
 		goto out;
 	}
 
 	index = state->tx_port_idx;
 	tgt_ifindex = (*key) & IFINDEX_MASK;
-	bpf_printk("xdp_timer_cb: tgt_ifindex %d tx_port_idx %lu\n", tgt_ifindex, index);
+	debug_printk("xdp_timer_cb: tgt_ifindex %d tx_port_idx %lu\n", tgt_ifindex, index);
 
 	for (i = 0; i < TX_BATCH_SIZE; i++) {
 		pkt = xdp_packet_dequeue(MAP_PTR(xdp_queues), index, NULL);
 		if (!pkt) {
-			bpf_printk("xdp_timer_cb: No packet returned\n");
+			debug_printk("xdp_timer_cb: No packet returned\n");
 			break;
 		}
 
-		bpf_printk("xdp_timer_cb: Sending to ifindex %d\n", tgt_ifindex);
+		debug_printk("xdp_timer_cb: Sending to ifindex %d\n", tgt_ifindex);
 		xdp_packet_send(pkt, tgt_ifindex, 0);
 	}
 
@@ -133,7 +141,7 @@ static int init_tx_port(int ifindex, __u32 cpu)
 		      bpf_timer_set_callback(&state->timer, xdp_timer_cb)     ?:
 										0;
 	if (!ret)
-		bpf_printk("TX port init OK ifindex %d cpu %u\n", ifindex, cpu);
+		debug_printk("TX port init OK ifindex %d cpu %u\n", ifindex, cpu);
 
 	return ret;
 }
@@ -179,11 +187,10 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
 
 	ret = bpf_redirect_map(&xdp_queues, state->tx_port_idx, 0);
 
-	bpf_printk("Redirect to XDP queue idx %d: %d\n", state->tx_port_idx, ret);
+	debug_printk("Redirect to XDP queue idx %d: %d\n", state->tx_port_idx, ret);
 
 	if (ret == XDP_REDIRECT && port_can_xmit(state)) {
-		int r = bpf_timer_start(&state->timer, 0 /* call asap */, 0);
-		bpf_printk("Started BPF timer: %d\n", r);
+		bpf_timer_start(&state->timer, 0 /* call asap */, 0);
 	}
 
 	return ret;

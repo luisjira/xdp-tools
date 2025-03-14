@@ -183,8 +183,7 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
 	debug_printk("Redirect to XDP queue idx %d: %d\n", state->tx_port_idx, ret);
 
 	if (ret == XDP_REDIRECT && port_can_xmit(state)) {
-		int r = bpf_timer_start(&state->timer, 0 /* call asap */, 0);
-		debug_printk("Started BPF timer: %d\n", r);
+		bpf_timer_start(&state->timer, 0 /* call asap */, 0);
 	}
 
 	return ret;

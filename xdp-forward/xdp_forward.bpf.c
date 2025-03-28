@@ -64,7 +64,6 @@ extern int bpf_dynptr_from_xdp_frame(struct xdp_frame *xdp, __u64 flags,
 struct port_state {
         struct bpf_timer timer;
         __u32   tx_port_idx;
-        __u64   bulk_cnt;               /* Track bytes of completed frames */
 
         /* DQL STATE */
         /* Fields accessed in enqueue path (dql_queued) */
@@ -82,6 +81,9 @@ struct port_state {
 
         __u64	lowest_slack;		/* Lowest slack found */
         __u64	slack_start_time;	/* Time slacks seen */
+
+        __u64   bulk_cnt;               /* Track bytes of completed frames */
+        __u64   prev_bulk_cnt;          /* Maintain value for analysis */
 
         /* Configuration */
         __u64	max_limit;		/* Max limit */
@@ -165,6 +167,7 @@ static int dql_completed(struct port_state *state)
 	bool all_prev_completed;
 
         count = state->bulk_cnt;
+        state->prev_bulk_cnt = state->bulk_cnt;
         state->bulk_cnt = 0;
 	num_queued = state->num_queued;
         num_completed = state->num_completed;

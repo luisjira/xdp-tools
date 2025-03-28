@@ -301,7 +301,6 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
         struct xdp_frame *pkt;
         int i, tgt_ifindex;
         int batch_size = TX_BATCH_SIZE;
-        __u64 len_sum = 0;
         __u64 index;
 
         state = bpf_map_lookup_elem(map, key);
@@ -312,23 +311,17 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
 
         index = state->tx_port_idx;
         tgt_ifindex = (*key) & IFINDEX_MASK;
-        // debug_printk("xdp_timer_cb %u: tgt_ifindex %d index %lu", 
-        //              state->tx_port_idx, tgt_ifindex, index);
-
-        if (dql_avail(state) < 0) {
-                debug_printk("xdp_timer_cb %d: No space in queue", 
-                             state->tx_port_idx);
-                goto out;
-        }
-
-        // TODO this breaks the eBPF compiler due to complexity
-        // if (batch_size > dql_avail(state)){
-        //         batch_size = dql_avail(state);
-        //         debug_printk("xdp_timer_cb %d: limited batch to %d", 
-        //                      state->tx_port_idx, batch_size);
-        // }
+        debug_printk("xdp_timer_cb %u: tgt_ifindex %d index %lu", 
+                     state->tx_port_idx, tgt_ifindex, index);
 
         for (i = 0; i < batch_size; i++) {
+                /* Stop dequeueing immediately, if over limit */
+                if (dql_avail(state) < 0) {
+                        debug_printk("xdp_timer_cb %u: No space in queue at %d", 
+                                     state->tx_port_idx, i);
+                        break;
+                }
+
                 pkt = xdp_packet_dequeue(MAP_PTR(xdp_queues), index, NULL);
                 // TODO remove callback timing code
                 // if (time_set) {
@@ -341,12 +334,11 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
                                      state->tx_port_idx, i);
                         break;
                 }
-                len_sum += pkt->len;
+                dql_queued(state,pkt->len);
                 xdp_packet_send(pkt, tgt_ifindex, 0);
         }
 
         xdp_packet_flush();
-        dql_queued(state,len_sum);
 
 out:
         return 0;

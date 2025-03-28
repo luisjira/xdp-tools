@@ -398,7 +398,6 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
         __u32 cpu = bpf_get_smp_processor_id();
         __u64 state_key = STATE_KEY(cpu, ifindex);
         struct port_state *state;
-        // __u32 len = ctx->data_end - ctx->data;
         void *data, *data_meta;
         struct meta_val *mval;
         int ret;
@@ -436,6 +435,26 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
         }
 
         return ret;
+}
+
+static int forward_prio_to_dst(struct xdp_md *ctx, int ifindex)
+{
+        void *data_end = (void *)(long)ctx->data_end;
+        void *data = (void *)(long)ctx->data;
+        __u32 cpu = bpf_get_smp_processor_id();
+        __u64 state_key = STATE_KEY(cpu, ifindex);
+        __u64 len = data_end - data;
+        struct port_state *state;
+
+        state = bpf_map_lookup_elem(&dst_port_state, &state_key);
+        if (!state)
+                return XDP_DROP;
+
+        debug_printk("========== New PRIO packet if: %d ==========",
+                state->tx_port_idx);
+
+        dql_queued(state, len);
+        return bpf_redirect_map(&xdp_tx_ports, ifindex, 0);
 }
 
 SEC("raw_tracepoint/xdp_frame_return")
@@ -604,7 +623,7 @@ static __always_inline int xdp_fwd_flags(struct xdp_md *ctx, __u32 flags)
                         if (iph->protocol == IPPROTO_ICMP) {
                                 __builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
 		                __builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
-		                return bpf_redirect_map(&xdp_tx_ports, fib_params.ifindex, 0);
+		                return forward_prio_to_dst(ctx, fib_params.ifindex);
                         }
                 }
                 else if (h_proto == bpf_htons(ETH_P_IPV6)) {
@@ -612,7 +631,7 @@ static __always_inline int xdp_fwd_flags(struct xdp_md *ctx, __u32 flags)
                         if (ip6h->nexthdr == IPPROTO_ICMPV6) {
                                 __builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
 		                __builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
-		                return bpf_redirect_map(&xdp_tx_ports, fib_params.ifindex, 0);
+		                return forward_prio_to_dst(ctx, fib_params.ifindex);
                         }
                 }
 

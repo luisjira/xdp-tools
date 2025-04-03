@@ -228,7 +228,12 @@ int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
 		goto out;
 
 	can_xmit = port_can_xmit(state);
-	state->outstanding_bytes -= pkt_len;
+        
+        if (state->outstanding_bytes > pkt_len){
+	        state->outstanding_bytes -= pkt_len;
+        } else {
+                state->outstanding_bytes = 0;
+        }
 
 	if (!can_xmit && port_can_xmit(state))
 		bpf_timer_start(&state->timer, 0, 0);

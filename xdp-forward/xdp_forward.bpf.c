@@ -112,10 +112,6 @@ struct {
         __uint(map_extra, MAX_TX_PORTS);
 } xdp_queues SEC(".maps");
 
-// TODO remove callback timing code
-bool time_set = false;
-__u64 timer_start;
-
 /* Returns how many objects can be queued, < 0 indicates over limit. */
 static int dql_avail(struct port_state *state)
 {
@@ -318,12 +314,7 @@ static int xdp_timer_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer
                 }
 
                 pkt = xdp_packet_dequeue(MAP_PTR(xdp_queues), index, NULL);
-                // TODO remove callback timing code
-                // if (time_set) {
-                //         debug_printk("xdp_timer_cb %u: callback time %u", 
-                //                      state->tx_port_idx, bpf_ktime_get_ns() - timer_start);
-                //         time_set = false;
-                // }
+
                 if (!pkt) {
                         debug_printk("xdp_timer_cb %u: No packet returned at iteration %d", 
                                      state->tx_port_idx, i);
@@ -418,11 +409,6 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
 
         if (ret == XDP_REDIRECT) {
                 debug_printk("fwd_to_dst %u: Redirecting", state->tx_port_idx);
-                // TODO remove callback timing code
-                // if(!time_set){
-                //         time_set = true;
-                //         timer_start = bpf_ktime_get_ns();
-                // }
 
                 bpf_timer_start(&state->timer, 0 /* call asap */, 0);
         }

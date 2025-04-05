@@ -179,7 +179,7 @@ static int dql_completed(struct port_state *state)
         /* Reset state before overflow */
         if(num_queued > (U64_MAX >> 1)){
                 // TODO remove
-                bpf_printk("dql_completed %d: RESET ======================",
+                debug_printk("dql_completed %d: RESET ======================",
                              state->tx_port_idx);
 
                 dql_reset(state);
@@ -483,6 +483,7 @@ int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
         if (bulk_remaining == 0) {
                 debug_printk("xdp_check_return %u: calling dql_completed", 
                              state->tx_port_idx);
+                debug_printk("Completing %u, available %d", state->bulk_cnt, dql_avail(state));
                 dql_completed(state);
 
                 /* 

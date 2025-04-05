@@ -171,7 +171,7 @@ static int dql_completed(struct port_state *state)
         /* Reset state before overflow */
         if(num_queued > (U64_MAX >> 1)){
                 // TODO remove
-                bpf_printk("dql_completed %d: RESET ======================",
+                debug_printk("dql_completed %d: RESET ======================",
                              state->tx_port_idx);
 
                 dql_reset(state);

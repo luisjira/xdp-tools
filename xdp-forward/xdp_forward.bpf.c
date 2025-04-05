@@ -423,11 +423,8 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
 
 static int forward_prio_to_dst(struct xdp_md *ctx, int ifindex)
 {
-        void *data_end = (void *)(long)ctx->data_end;
-        void *data = (void *)(long)ctx->data;
         __u32 cpu = bpf_get_smp_processor_id();
         __u64 state_key = STATE_KEY(cpu, ifindex);
-        __u64 len = data_end - data;
         struct port_state *state;
 
         state = bpf_map_lookup_elem(&dst_port_state, &state_key);
@@ -437,7 +434,6 @@ static int forward_prio_to_dst(struct xdp_md *ctx, int ifindex)
         debug_printk("========== New PRIO packet if: %d ==========",
                 state->tx_port_idx);
 
-        dql_queued(state, len);
         return bpf_redirect_map(&xdp_tx_ports, ifindex, 0);
 }
 

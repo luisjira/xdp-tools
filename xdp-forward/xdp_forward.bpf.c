@@ -62,7 +62,8 @@ extern int bpf_dynptr_from_xdp_frame(struct xdp_frame *xdp, __u64 flags,
                                      struct bpf_dynptr *ptr__uninit) __ksym;
 
 struct port_state {
-        struct bpf_timer timer;
+        struct bpf_timer dequeue_timer;
+        struct bpf_timer completion_timer;
         __u32   tx_port_idx;
 
         /* DQL STATE */
@@ -156,11 +157,18 @@ static inline void dql_reset(struct port_state *state)
 }
 
 /* Records completed count and recalculates the queue limit */
-static int dql_completed(struct port_state *state)
+static int dql_completed_cb(struct bpf_map *map, __u64 *key, struct bpf_timer *timer)
 {
+        __u64 ovlimit, completed, num_completed, num_queued;
         __u64 count, inprogress, prev_inprogress, limit;
-	__u64 ovlimit, completed, num_completed, num_queued;
+        struct port_state *state;
 	bool all_prev_completed;
+
+        state = bpf_map_lookup_elem(map, key);
+        if (!state) {
+                debug_printk("dql_completed_cb: No state found for key %lu", *key);
+                return 0;
+        }
 
         count = state->bulk_cnt;
         state->prev_bulk_cnt = state->bulk_cnt;
@@ -186,7 +194,7 @@ static int dql_completed(struct port_state *state)
                                 num_queued,
                                 state->num_completed);
 
-                return -1;
+                return 0;
         }
 
 	completed = num_completed + count;
@@ -218,8 +226,8 @@ static int dql_completed(struct port_state *state)
 		state->slack_start_time = JIFFIES;
 		state->lowest_slack = U64_MAX;
 
-                debug_printk("dql_completed %u: queue starved, new limit %u, POSDIFF %u, prev_ovlimit %u",
-                             state->tx_port_idx, limit,
+                bpf_printk("dql_completed %u: queue starved, completed %u, new limit %u, POSDIFF %u, prev_ovlimit %u",
+                             state->tx_port_idx, completed, limit,
                              POSDIFF(completed, state->prev_num_queued),
                              state->prev_ovlimit);
 	} else if (inprogress && prev_inprogress && !all_prev_completed) {
@@ -259,8 +267,8 @@ static int dql_completed(struct port_state *state)
 
                 /* Check if current time past slack_start + slack_hold*/
 		if (JIFFIES >= state->slack_start_time + state->slack_hold_time) {
-                        debug_printk("dql_completed %u: decrease limit %u, lowest_slack %u",
-                                     state->tx_port_idx, limit, state->lowest_slack);
+                        bpf_printk("dql_completed %u: completed %u, decrease limit %u, lowest_slack %u",
+                                     state->tx_port_idx, completed, limit, state->lowest_slack);
 			limit = POSDIFF(limit, state->lowest_slack);
 			state->slack_start_time = JIFFIES;
 			state->lowest_slack = U64_MAX;
@@ -282,6 +290,10 @@ static int dql_completed(struct port_state *state)
 	state->prev_last_obj_cnt = state->last_obj_cnt;
 	state->num_completed = completed;
 	state->prev_num_queued = num_queued;
+
+        /* If space has become available, start dequeue timer */
+        if (dql_avail(state) >= 0)
+                bpf_timer_start(&state->dequeue_timer, 0, 0);
         
         return 0;
 }
@@ -359,8 +371,14 @@ static int init_tx_port(int ifindex, __u32 cpu)
         if (!state)
                 return -1;
 
-        ret = bpf_timer_init(&state->timer, &dst_port_state, CLOCK_MONOTONIC) ?:
-                      bpf_timer_set_callback(&state->timer, xdp_timer_cb)     ?:
+        ret = bpf_timer_init(&state->dequeue_timer, &dst_port_state, CLOCK_MONOTONIC) ?:
+                      bpf_timer_set_callback(&state->dequeue_timer, xdp_timer_cb)     ?:
+                                                                                0;
+        if (ret)
+                return ret;
+
+        ret = bpf_timer_init(&state->completion_timer, &dst_port_state, CLOCK_MONOTONIC) ?:
+                      bpf_timer_set_callback(&state->completion_timer, dql_completed_cb)     ?:
                                                                                 0;
         if (!ret)
                 debug_printk("TX port init OK ifindex %d cpu %u\n", ifindex, cpu);
@@ -410,7 +428,7 @@ static int forward_to_dst(struct xdp_md *ctx, int ifindex)
         if (ret == XDP_REDIRECT) {
                 debug_printk("fwd_to_dst %u: Redirecting", state->tx_port_idx);
 
-                bpf_timer_start(&state->timer, 0 /* call asap */, 0);
+                bpf_timer_start(&state->dequeue_timer, 0 /* call asap */, 0);
         }
 
         return ret;
@@ -420,12 +438,11 @@ SEC("raw_tracepoint/xdp_frame_return")
 int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
 {
         struct xdp_frame *frm = (struct xdp_frame *)ctx->args[0];
-        __u16 bulk_remaining = ctx->args[1];
+        // __u16 bulk_remaining = ctx->args[1];
         struct port_state *state;
         struct meta_val meta;
         __u32 metasize;
         __u16 pkt_len;
-        bool can_queue;
         void *data;
 
         pkt_len = BPF_CORE_READ(frm, len);
@@ -447,27 +464,18 @@ int xdp_check_return(struct bpf_raw_tracepoint_args* ctx)
         if (!state)
                 goto out;
 
-        can_queue = dql_avail(state) >= 0;
         state->bulk_cnt += pkt_len;
-
+        bpf_timer_start(&state->completion_timer, 0, 0);
 
         debug_printk("xdp_check_return %u: bulk_remaining %u", 
                              state->tx_port_idx, bulk_remaining);
 
         /* Don't execute dql_completed for every single packet */
-        if (bulk_remaining == 0) {
-                debug_printk("xdp_check_return %u: calling dql_completed", 
-                             state->tx_port_idx);
-                dql_completed(state);
-
-                /* 
-                 * Check again in case another CPU has just made room available
-                 * Only useful if running dql at xdp_queue dequeue
-                 * Otherwise this does nothing
-                 */
-                if (!can_queue && (dql_avail(state) >= 0))
-                        bpf_timer_start(&state->timer, 0, 0);
-        }
+        // if (bulk_remaining == 0) {
+        //         debug_printk("xdp_check_return %u: calling dql_completed", 
+        //                      state->tx_port_idx);
+        //         bpf_timer_start(&state->completion_timer, 0, 0);
+        // }
 
 out:
         return 0;
